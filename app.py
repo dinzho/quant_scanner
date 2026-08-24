@@ -10,7 +10,6 @@ from datetime import datetime, timedelta
 import logging
 import requests
 import time
-from dateutil import parser as date_parser
 
 # ------------------------------------------------------------------------------
 # 配置與常量定義
@@ -27,8 +26,8 @@ logger = logging.getLogger(__name__)
 # 常量定義
 MAX_TICKERS = 50
 REQUEST_TIMEOUT = 30
-CACHE_TTL_HISTORY = 600  # Finnhub 歷史數據快取 10 分鐘
-CACHE_TTL_PRICE = 60     # YF 即時價格快取 1 分鐘
+CACHE_TTL_HISTORY = 600  # 歷史數據快取 10 分鐘
+CACHE_TTL_PRICE = 60     # 即時價格快取 1 分鐘
 CACHE_TTL_NEWS = 300     # 新聞快取 5 分鐘
 MIN_DATA_POINTS = 60
 VOL_SPIKE_THRESHOLD = 1.5
@@ -45,39 +44,81 @@ NEWS_CACHE = {}
 
 # 頁面配置
 st.set_page_config(
-    page_title="多週期量化策略掃描器 (Finnhub + YF)",
+    page_title="多週期量化策略掃描器 (混合架構)",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
 
 st.title("📈 多週期波浪形態量化策略掃描器")
-st.caption("Finnhub 歷史數據 + Yahoo 實時價格 | 道氏趨勢 + FIB 黃金口袋區")
+st.caption("Finnhub (歷史) + Yahoo (實時/備援) | 道氏趨勢 + FIB 黃金口袋區")
 
 
 # ------------------------------------------------------------------------------
-# 側邊欄：API Key 配置
+# 側邊欄：API Key 配置與驗證
 # ------------------------------------------------------------------------------
 with st.sidebar:
     st.header("⚙️ API 配置")
+    
+    # 初始化 Session State
+    if 'FINNHUB_KEY' not in st.session_state:
+        st.session_state['FINNHUB_KEY'] = ""
+    if 'API_VALID' not in st.session_state:
+        st.session_state['API_VALID'] = False
+
     finnhub_key = st.text_input(
         "Finnhub API Key",
         type="password",
+        value=st.session_state['FINNHUB_KEY'],
         help="請在 finnhub.io 免費註冊獲取 API Key",
         placeholder="輸入您的 Finnhub API Key"
     )
     
-    if finnhub_key:
-        st.success("✅ API Key 已設置")
-        # 將 Key 存入 session state 供全局使用
+    if finnhub_key != st.session_state['FINNHUB_KEY']:
         st.session_state['FINNHUB_KEY'] = finnhub_key
+        st.session_state['API_VALID'] = False  # Key 變更後重置驗證狀態
+
+    col_btn, col_info = st.columns([1, 2])
+    with col_btn:
+        test_btn = st.button("🧪 測試連線", use_container_width=True)
+    
+    if test_btn and finnhub_key:
+        with st.spinner("驗證中..."):
+            try:
+                # 發送輕量請求測試 Key 有效性
+                url = "https://finnhub.io/api/v1/stock/candle"
+                params = {
+                    'symbol': 'AAPL',
+                    'resolution': 'D',
+                    'from': int(time.time()) - 86400, # 只請求昨天
+                    'to': int(time.time()),
+                    'token': finnhub_key
+                }
+                resp = requests.get(url, params=params, timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data['s'] == 'ok':
+                        st.success("✅ API Key 有效！")
+                        st.session_state['API_VALID'] = True
+                    else:
+                        st.error(f"❌ API 返回錯誤: {data['s']}")
+                        st.session_state['API_VALID'] = False
+                else:
+                    st.error(f"❌ 請求失敗: {resp.status_code}")
+                    st.session_state['API_VALID'] = False
+            except Exception as e:
+                st.error(f"❌ 連線錯誤: {str(e)}")
+                st.session_state['API_VALID'] = False
+    
+    if st.session_state['API_VALID']:
+        st.success("✅ API Key 已設置並驗證通過")
+    elif finnhub_key:
+        st.warning("⚠️ 請點擊「測試連線」驗證 Key")
     else:
-        st.warning("⚠️ 請輸入 Finnhub API Key 以獲取歷史數據")
-        if 'FINNHUB_KEY' in st.session_state:
-            del st.session_state['FINNHUB_KEY']
+        st.warning("⚠️ 請輸入 Finnhub API Key")
     
     st.markdown("---")
-    st.info("💡 **說明**:\n- **歷史數據**: 使用 Finnhub (穩定/無限制)\n- **即時價格**: 使用 Yahoo Finance\n- **新聞**: 使用 Yahoo Finance")
+    st.info("💡 **混合架構說明**:\n- **日線**: Finnhub (最近 365 天)\n- **周/月線**: Finnhub 優先，失敗自動轉 Yahoo\n- **即時價格**: Yahoo Finance\n- **新聞**: Yahoo Finance")
 
 
 # ------------------------------------------------------------------------------
@@ -107,11 +148,11 @@ def parse_tickers(raw_input: str) -> List[str]:
 
 
 # ------------------------------------------------------------------------------
-# 數據抓取模組 (混合架構)
+# 數據抓取模組 (混合架構 + 重試機制)
 # ------------------------------------------------------------------------------
-def fetch_finnhub_history(ticker: str, resolution: str, count: int) -> Optional[pd.DataFrame]:
+def fetch_finnhub_history(ticker: str, resolution: str, count_days: int) -> Optional[pd.DataFrame]:
     """
-    使用 Finnhub 抓取歷史 K 線
+    使用 Finnhub 抓取歷史 K 線 (含重試機制)
     resolution: D (日), W (周), M (月), 60 (小時)
     """
     api_key = st.session_state.get('FINNHUB_KEY')
@@ -119,7 +160,7 @@ def fetch_finnhub_history(ticker: str, resolution: str, count: int) -> Optional[
         return None
     
     end_time = int(time.time())
-    start_time = end_time - (count * 24 * 60 * 60) # 簡化計算天數
+    start_time = end_time - (count_days * 24 * 60 * 60)
     
     url = "https://finnhub.io/api/v1/stock/candle"
     params = {
@@ -130,13 +171,15 @@ def fetch_finnhub_history(ticker: str, resolution: str, count: int) -> Optional[
         'token': api_key
     }
     
-    try:
-        # 重試機制
-        for attempt in range(3):
+    # 重試機制 (Exponential Backoff)
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
             response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            
             if response.status_code == 200:
                 data = response.json()
-                if data['s'] == 'ok':
+                if data['s'] == 'ok' and len(data.get('c', [])) > 0:
                     df = pd.DataFrame({
                         'Open': data['o'],
                         'High': data['h'],
@@ -147,33 +190,70 @@ def fetch_finnhub_history(ticker: str, resolution: str, count: int) -> Optional[
                     df.index = pd.to_datetime(data['t'], unit='s')
                     return df
                 else:
-                    logger.warning(f"{ticker}: Finnhub 返回狀態 {data['s']}")
+                    # 數據為空或狀態異常
                     return None
             elif response.status_code == 429:
                 wait_time = (attempt + 1) * 2
-                logger.warning(f"{ticker}: 觸發速率限制，等待 {wait_time}秒...")
+                logger.warning(f"{ticker}: 觸發速率限制 (429)，等待 {wait_time}秒... (嘗試 {attempt+1}/{max_retries})")
+                time.sleep(wait_time)
+            elif response.status_code == 503:
+                wait_time = (attempt + 1) * 2
+                logger.warning(f"{ticker}: 服務暫時不可用 (503)，等待 {wait_time}秒...")
                 time.sleep(wait_time)
             else:
                 logger.error(f"{ticker}: Finnhub 請求失敗 {response.status_code}")
                 return None
+                
+        except Exception as e:
+            logger.error(f"{ticker}: Finnhub 異常 - {str(e)}")
+            if attempt < max_retries - 1:
+                time.sleep(2)
+            continue
+            
+    return None
+
+def fetch_yf_history_backup(ticker: str, interval: str, period: str) -> Optional[pd.DataFrame]:
+    """
+    Yahoo Finance 備用歷史數據抓取 (用於周線/月線)
+    """
+    try:
+        tk = yf.Ticker(ticker)
+        df = tk.history(period=period, interval=interval, timeout=REQUEST_TIMEOUT)
+        if df is not None and not df.empty:
+            # 確保列名一致
+            df = df.rename(columns={'Open': 'Open', 'High': 'High', 'Low': 'Low', 'Close': 'Close', 'Volume': 'Volume'})
+            return df[['Open', 'High', 'Low', 'Close', 'Volume']]
         return None
     except Exception as e:
-        logger.error(f"{ticker}: Finnhub 異常 - {str(e)}")
+        logger.warning(f"{ticker}: YF 歷史備援抓取失敗 ({interval}/{period}) - {str(e)}")
         return None
 
 @st.cache_data(ttl=CACHE_TTL_HISTORY, show_spinner=False)
 def fetch_multi_period_data(ticker_symbol: str) -> Optional[Dict[str, pd.DataFrame]]:
-    """抓取多週期歷史數據 (使用 Finnhub)"""
-    if 'FINNHUB_KEY' not in st.session_state:
+    """抓取多週期歷史數據 (Finnhub 優先 + YF 備援)"""
+    if not st.session_state.get('FINNHUB_KEY'):
         return None
 
     try:
-        # 抓取不同週期
-        df_monthly = fetch_finnhub_history(ticker_symbol, 'M', 1500) # 約 5 年
-        df_weekly = fetch_finnhub_history(ticker_symbol, 'W', 1500)
-        df_daily = fetch_finnhub_history(ticker_symbol, 'D', 1000)
-        df_hourly = fetch_finnhub_history(ticker_symbol, '60', 90) # 約 3-4 個月
+        # 1. 日線：嚴格限制 365 天 (Free 版穩定範圍)
+        df_daily = fetch_finnhub_history(ticker_symbol, 'D', 365)
         
+        # 2. 周線：Finnhub 優先，失敗則用 YF (2 年)
+        df_weekly = fetch_finnhub_history(ticker_symbol, 'W', 730)
+        if df_weekly is None or df_weekly.empty:
+            logger.info(f"{ticker_symbol}: Finnhub 周線無數據，切換至 Yahoo Finance")
+            df_weekly = fetch_yf_history_backup(ticker_symbol, '1wk', '2y')
+        
+        # 3. 月線：Finnhub 優先，失敗則用 YF (5 年)
+        df_monthly = fetch_finnhub_history(ticker_symbol, 'M', 1800)
+        if df_monthly is None or df_monthly.empty:
+            logger.info(f"{ticker_symbol}: Finnhub 月線無數據，切換至 Yahoo Finance")
+            df_monthly = fetch_yf_history_backup(ticker_symbol, '1mo', '5y')
+        
+        # 4. 小時線：Finnhub (90 天)
+        df_hourly = fetch_finnhub_history(ticker_symbol, '60', 90)
+        
+        # 基本數據完整性檢查 (至少要有日線)
         if df_daily is None or len(df_daily) < MIN_DATA_POINTS:
             return None
         
@@ -191,7 +271,6 @@ def fetch_multi_period_data(ticker_symbol: str) -> Optional[Dict[str, pd.DataFra
 def fetch_yf_hourly_and_price(ticker_symbol: str) -> Tuple[Optional[pd.DataFrame], Optional[Dict[str, Any]]]:
     """
     使用 Yahoo Finance 抓取即時價格和備用小時線
-    修復語法錯誤：添加缺失的閉合括號
     """
     try:
         ticker = yf.Ticker(ticker_symbol)
@@ -225,14 +304,13 @@ def fetch_yf_hourly_and_price(ticker_symbol: str) -> Tuple[Optional[pd.DataFrame
                 if df_1m is not None and not df_1m.empty:
                     curr_price = float(df_1m['Close'].iloc[-1])
                     source = "1 分 K"
-                    # 嘗試從日線獲取昨收
                     df_1d = ticker.history(period="5d", interval="1d", timeout=10)
                     if df_1d is not None and len(df_1d) >= 2:
                         prev_close = df_1d['Close'].iloc[-2]
             except Exception:
                 pass
         
-        # 3. 獲取備用小時線 (如果 Finnhub 失敗或需要補充)
+        # 3. 獲取備用小時線
         try:
             df_hourly_backup = ticker.history(period="1mo", interval="1h", prepost=True, timeout=10)
         except Exception:
@@ -417,14 +495,14 @@ def fetch_news(ticker_symbol: str) -> List[Dict[str, Any]]:
 
 def analyze_single_stock(ticker: str) -> Optional[Dict[str, Any]]:
     try:
-        # 1. 抓取 Finnhub 歷史數據
+        # 1. 抓取混合歷史數據
         historical_data = fetch_multi_period_data(ticker)
         
         # 2. 抓取 YF 即時價格
         df_hourly_yf, price_data = fetch_yf_hourly_and_price(ticker)
         
         if historical_data is None or price_data is None:
-            logger.warning(f"{ticker}: 數據不完整 (Finnhub Key 缺失或 YF 限制)")
+            logger.warning(f"{ticker}: 數據不完整 (Key 缺失/限制/網絡錯誤)")
             return None
         
         curr_price = price_data["price"]
@@ -476,7 +554,6 @@ def analyze_single_stock(ticker: str) -> Optional[Dict[str, Any]]:
         return None
 
 def analyze_stocks_parallel(tickers: List[str], max_workers: int = 3) -> List[Dict[str, Any]]:
-    # 降低並發數至 3，進一步避免 YF 限制
     results = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_ticker = {executor.submit(analyze_single_stock, t): t for t in tickers}
@@ -510,7 +587,7 @@ def generate_scenarios(f618: float, f786: float, d_h: float, trends: Dict[str, s
 
 def render_results(results: List[Dict[str, Any]]):
     if not results:
-        st.error("無法取得數據。請檢查 Finnhub API Key 是否正確，或稍後再試 (Yahoo 可能暫時限制)。")
+        st.error("無法取得數據。請檢查：\n1. Finnhub API Key 是否正確且已驗證\n2. 網絡連線是否正常\n3. 是否觸發 Yahoo 臨時限制 (請稍後再試)")
         return
     
     st.subheader("📊 實時盤口總覽")
@@ -577,8 +654,8 @@ def main():
             st.warning("請輸入有效代碼")
             return
         
-        if 'FINNHUB_KEY' not in st.session_state:
-            st.error("❌ 請在左側側邊欄輸入 Finnhub API Key！")
+        if not st.session_state.get('FINNHUB_KEY'):
+            st.error("❌ 請在左側側邊欄輸入並驗證 Finnhub API Key！")
             return
             
         with st.spinner(f"正在抓取數據 (Finnhub 歷史 + YF 實時)..."):
