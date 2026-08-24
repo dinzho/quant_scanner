@@ -8,7 +8,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Dict, List, Any, Tuple
 from datetime import datetime, timedelta
 import logging
-from dateutil import parser as date_parser
+from bs4 import BeautifulSoup
+import requests
 import time
 
 # ------------------------------------------------------------------------------
@@ -42,9 +43,6 @@ FIB_LEVELS = {
     '786': 0.786,
     '1000': 1.0
 }
-
-# 新聞快取字典
-NEWS_CACHE = {}
 
 # 頁面配置
 st.set_page_config(
@@ -197,18 +195,23 @@ def identify_trend_direction(df: pd.DataFrame, period_name: str) -> str:
         return "數據不足"
     
     try:
+        # 計算高點和低點的序列
         highs = df['High'].values
         lows = df['Low'].values
         
+        # 最近 10 個週期的高點和低點
         recent_highs = highs[-10:]
         recent_lows = lows[-10:]
         
+        # 判斷是否形成更高的高點 (HH) 和更高的低點 (HL)
         hh_count = sum(1 for i in range(1, len(recent_highs)) if recent_highs[i] > recent_highs[i-1])
         hl_count = sum(1 for i in range(1, len(recent_lows)) if recent_lows[i] > recent_lows[i-1])
         
+        # 判斷是否形成更低的高點 (LH) 和更低的低點 (LL)
         lh_count = sum(1 for i in range(1, len(recent_highs)) if recent_highs[i] < recent_highs[i-1])
         ll_count = sum(1 for i in range(1, len(recent_lows)) if recent_lows[i] < recent_lows[i-1])
         
+        # 道氏理論判斷
         if hh_count >= 6 and hl_count >= 6:
             return "上漲"
         elif lh_count >= 6 and ll_count >= 6:
@@ -229,6 +232,7 @@ def identify_wave_stage(df: pd.DataFrame, trend: str, period_name: str) -> str:
         return "數據不足"
     
     try:
+        # 計算移動平均線作為趨勢參考
         ma20 = df['Close'].rolling(20).mean().iloc[-1]
         ma50 = df['Close'].rolling(50).mean().iloc[-1] if len(df) >= 50 else ma20
         current_price = df['Close'].iloc[-1]
@@ -285,6 +289,7 @@ def check_hourly_signal(df_hourly: pd.DataFrame, curr_price: float, fib_786: flo
     try:
         df_hourly = df_hourly.copy()
         
+        # 計算 EMA20
         df_hourly['EMA20'] = df_hourly['Close'].ewm(span=EMA_PERIOD, adjust=False).mean()
         df_hourly['Vol_MA'] = df_hourly['Volume'].rolling(20).mean()
         
@@ -301,11 +306,15 @@ def check_hourly_signal(df_hourly: pd.DataFrame, curr_price: float, fib_786: flo
         if any(pd.isna([c_prev, ema_prev, ema_curr, vol_curr, vol_prev, vol_ma])):
             return False, round(fib_786 * 0.98, 2)
         
+        # 突破條件
         h_breakout = (c_prev <= ema_prev) and (curr_price > ema_curr)
+        
+        # 成交量放大條件
         h_vol_spike = max(vol_curr, vol_prev) > (vol_ma * VOL_SPIKE_THRESHOLD)
         
         hourly_triggered = bool(h_breakout and h_vol_spike)
         
+        # 動態止損
         hourly_low_min = df_hourly['Low'].tail(15).min()
         hourly_stop_loss = round(min(hourly_low_min, fib_786) * 0.99, 2)
         
@@ -320,15 +329,18 @@ def calculate_confidence_score(trends: Dict[str, str], in_fib_zone: bool, hourly
     """計算策略信心等級"""
     score = 0
     
+    # 趨勢一致性評分
     trend_values = list(trends.values())
     if len(set(trend_values)) == 1 and trend_values[0] == "上漲":
-        score += 3
+        score += 3  # 多週期共振上漲
     elif trend_values.count("上漲") >= 2:
         score += 2
     
+    # FIB 區域評分
     if in_fib_zone:
         score += 2
     
+    # 小時線訊號評分
     if hourly_triggered:
         score += 2
     
@@ -349,6 +361,7 @@ def determine_strategy(trends: Dict[str, str], in_fib_zone: bool,
     weekly_trend = trends.get("weekly", "")
     daily_trend = trends.get("daily", "")
     
+    # 大周期主導原則
     if monthly_trend == "上漲" and weekly_trend == "上漲" and in_fib_zone and hourly_triggered:
         return {
             "strategy": "🚀 大主升浪起場點 (多週期共振)",
@@ -382,10 +395,10 @@ def determine_strategy(trends: Dict[str, str], in_fib_zone: bool,
 
 
 # ------------------------------------------------------------------------------
-# 新聞模組 (已修復)
+# 新聞模組
 # ------------------------------------------------------------------------------
 def fetch_news(ticker_symbol: str) -> List[Dict[str, Any]]:
-    """抓取個股新聞 (修復版：直接解析 yfinance 標準結構)"""
+    """抓取個股新聞"""
     try:
         cache_key = f"{ticker_symbol}_{datetime.now().strftime('%Y-%m-%d_%H')}"
         if cache_key in NEWS_CACHE:
@@ -397,49 +410,28 @@ def fetch_news(ticker_symbol: str) -> List[Dict[str, Any]]:
         news_list = []
         
         try:
-            # yfinance 返回的新聞列表通常是字典列表
             news_items = ticker.news
-            if news_items and isinstance(news_items, list):
+            if news_items:
                 for item in news_items[:5]:
-                    if not isinstance(item, dict):
-                        continue
-                        
-                    # 安全獲取字段
                     title = item.get("title", "無標題")
-                    publisher = item.get("publisher", "未知來源")
-                    link = item.get("link", "")
-                    
-                    # 處理時間
-                    pub_time = item.get("providerPublishTime")
-                    time_str = "未知時間"
-                    if pub_time:
-                        try:
-                            time_str = datetime.fromtimestamp(pub_time).strftime("%Y-%m-%d %H:%M")
-                        except:
-                            time_str = "格式錯誤"
-                    
-                    # 情感分析 (標題 + 摘要如果有)
-                    text_content = (title + " " + item.get("summary", "")).lower()
+                    title_lower = title.lower()
                     
                     news_type = "中性"
-                    positive_words = ['beat', 'surge', 'gain', 'up', 'rise', 'buy', 'upgrade', 'record', 'profit', 'strong', 'growth', 'soar', 'jump']
-                    negative_words = ['miss', 'drop', 'fall', 'down', 'sell', 'downgrade', 'lawsuit', 'loss', 'warning', 'weak', 'decline', 'slump', 'cut']
-                    
-                    if any(word in text_content for word in positive_words):
+                    if any(word in title_lower for word in ['beat', 'surge', 'gain', 'up', 'rise', 'buy', 'upgrade', 'record', 'profit']):
                         news_type = "利好"
-                    elif any(word in text_content for word in negative_words):
+                    elif any(word in title_lower for word in ['miss', 'drop', 'fall', 'down', 'sell', 'downgrade', 'lawsuit', 'loss', 'warning']):
                         news_type = "利空"
                     
                     news_entry = {
                         "title": title,
-                        "publisher": publisher,
-                        "link": link,
-                        "time": time_str,
+                        "publisher": item.get("publisher", "未知來源"),
+                        "link": item.get("link", ""),
+                        "time": datetime.fromtimestamp(item.get("providerPublishTime", 0)).strftime("%Y-%m-%d %H:%M") if item.get("providerPublishTime") else "未知時間",
                         "type": news_type
                     }
                     news_list.append(news_entry)
-        except Exception as e:
-            logger.debug(f"{ticker_symbol}: 新聞解析細節錯誤 - {str(e)}")
+        except Exception:
+            pass
         
         if news_list:
             NEWS_CACHE[cache_key] = (datetime.now(), news_list)
@@ -457,6 +449,7 @@ def fetch_news(ticker_symbol: str) -> List[Dict[str, Any]]:
 def analyze_single_stock(ticker: str) -> Optional[Dict[str, Any]]:
     """分析單支股票（完整多週期流程）"""
     try:
+        # 並行抓取數據
         historical_data = fetch_multi_period_data(ticker)
         price_data = fetch_current_price(ticker)
         
@@ -474,7 +467,7 @@ def analyze_single_stock(ticker: str) -> Optional[Dict[str, Any]]:
         df_daily = historical_data["daily"]
         df_hourly = historical_data["hourly"]
         
-        # 1. 多週期趨勢判斷
+        # 1. 多週期趨勢判斷 (道氏理論)
         trends = {
             "monthly": identify_trend_direction(df_monthly, "月線"),
             "weekly": identify_trend_direction(df_weekly, "周線"),
@@ -496,7 +489,7 @@ def analyze_single_stock(ticker: str) -> Optional[Dict[str, Any]]:
         fib_786 = fib_data.get('fib_786', 0)
         daily_high = fib_data.get('daily_high', curr_price)
         
-        # 4. 判斷是否在 FIB 黃金口袋區
+        # 4. 判斷是否在 FIB 黃金口袋區 (0.618-0.786)
         in_fib_zone = (curr_price >= fib_786 * 0.99) and (curr_price <= fib_618 * 1.01)
         
         # 5. 小時線訊號檢測
@@ -507,9 +500,6 @@ def analyze_single_stock(ticker: str) -> Optional[Dict[str, Any]]:
         
         # 7. 確定策略
         strategy_info = determine_strategy(trends, in_fib_zone, hourly_triggered, curr_price, fib_618, confidence)
-        
-        # 8. 獲取新聞
-        news_list = fetch_news(ticker)
         
         # 9. 計算距離百分比
         dist_618 = round(((curr_price - fib_618) / fib_618) * 100, 2) if fib_618 > 0 else 0
@@ -564,61 +554,34 @@ def analyze_stocks_parallel(tickers: List[str], max_workers: int = 5) -> List[Di
 
 
 # ------------------------------------------------------------------------------
-# 壓力測試情景生成 (含推導依據)
+# 壓力測試情景生成
 # ------------------------------------------------------------------------------
 def generate_scenarios(f618: float, f786: float, d_h: float, trends: Dict[str, str]) -> pd.DataFrame:
     """基於多週期分析生成壓力測試情景"""
     
-    monthly_trend = trends.get("monthly", "盤整")
-    weekly_trend = trends.get("weekly", "盤整")
-    daily_trend = trends.get("daily", "盤整")
-    
-    # 情境 1: 回測 FIB 0.618
-    scenario1_basis = "月線 + 周線趨勢"
-    if monthly_trend == "上漲" or weekly_trend == "上漲":
-        s1_strategy = "🚀 長/中線重倉"
-        s1_pos = "60%-80%"
-    else:
-        s1_strategy = "⚖️ 觀望/輕倉試單"
-        s1_pos = "0%-20%"
-    
-    # 情境 2: 跌破 FIB 0.786
-    scenario2_basis = "FIB 支撐失效原理"
-    s2_strategy = "👀 離場觀望"
-    s2_pos = "0%"
-    
-    # 情境 3: 突破前高
-    scenario3_basis = "日線 + 周線趨勢"
-    if daily_trend == "上漲" and weekly_trend == "上漲":
-        s3_strategy = "⚡ 順勢追漲"
-        s3_pos = "20%-30%"
-    else:
-        s3_strategy = "⚠️ 謹慎追高/假突破風險"
-        s3_pos = "10%-15%"
+    # 根據大周期趨勢調整情境描述
+    major_trend = trends.get("weekly", "盤整")
     
     scenarios = [
         {
-            "情境": "1. 回測 FIB 0.618 黃金區",
+            "情境": "1. 低吸黃金區 (FIB 0.618)",
             "模擬價": f"${round(f618 * 1.002, 2)}",
-            "策略": s1_strategy,
-            "倉位": s1_pos,
-            "推導依據": scenario1_basis,
+            "策略": "🚀 長/中線重倉" if major_trend == "上漲" else "⚖️ 中線建倉",
+            "倉位": "70%-100%" if major_trend == "上漲" else "40%-60%",
             "止損": f"${round(f786 * 0.98, 2)}"
         },
         {
-            "情境": "2. 跌破 FIB 0.786 支撐",
+            "情境": "2. 跌破 FIB 0.786",
             "模擬價": f"${round(f786 * 0.97, 2)}",
-            "策略": s2_strategy,
-            "倉位": s2_pos,
-            "推導依據": scenario2_basis,
+            "策略": "👀 離場觀望",
+            "倉位": "0%",
             "止損": "N/A"
         },
         {
-            "情境": "3. 突破前高阻力",
+            "情境": "3. 突破前高",
             "模擬價": f"${round(d_h * 1.01, 2)}",
-            "策略": s3_strategy,
-            "倉位": s3_pos,
-            "推導依據": scenario3_basis,
+            "策略": "⚡ 短線追漲" if major_trend == "上漲" else "⚠️ 謹慎追高",
+            "倉位": "20%-30%" if major_trend == "上漲" else "10%-15%",
             "止損": f"${round(d_h * 0.97, 2)}"
         }
     ]
@@ -636,12 +599,12 @@ def render_results(results: List[Dict[str, Any]]):
     
     st.subheader("📊 實時盤口總覽")
     
-    # 準備顯示數據
+    # 顯示簡潔表格
     df_display = pd.DataFrame(results)[
         ["代碼", "現價", "漲跌額", "漲跌幅", "來源", "建議策略", "建議倉位", "Fib 0.618", "距 0.618(%)", "止損價", "confidence"]
     ]
     
-    # 格式化函數
+    # 格式化漲跌幅顯示
     def format_change(row):
         if row['漲跌幅'] is None:
             return "N/A"
@@ -659,21 +622,9 @@ def render_results(results: List[Dict[str, Any]]):
     
     df_display['漲跌'] = df_display.apply(format_change, axis=1)
     df_display['信心'] = df_display['confidence'].apply(format_confidence)
+    df_display = df_display.drop(columns=['漲跌額', '漲跌幅', 'confidence'])
     
-    # 選擇最終顯示的欄位 (移除原始數據列)
-    final_columns = ["代碼", "現價", "漲跌", "來源", "建議策略", "建議倉位", "Fib 0.618", "距 0.618(%)", "止損價", "信心"]
-    df_final = df_display[final_columns]
-    
-    # 配置列寬與置中
-    column_config = {
-        col: st.column_config.TextColumn(width="medium", align="center") 
-        for col in final_columns
-    }
-    # 特別調整策略列寬度
-    column_config["建議策略"] = st.column_config.TextColumn(width="large", align="center")
-    column_config["代碼"] = st.column_config.TextColumn(width="small", align="center")
-    
-    st.dataframe(df_final, use_container_width=True, hide_index=True, column_config=column_config)
+    st.dataframe(df_display, use_container_width=True, hide_index=True)
     
     st.divider()
     st.subheader("📱 手機卡片與多週期詳情")
@@ -684,6 +635,7 @@ def render_results(results: List[Dict[str, Any]]):
             f"📌 **{res['代碼']}** - {res['建議策略']} (現價: ${res['現價']})",
             expanded=True
         ):
+            # 獲取漲跌數據
             change_percent = res.get('漲跌幅')
             change_amount = res.get('漲跌額')
             
@@ -693,6 +645,7 @@ def render_results(results: List[Dict[str, Any]]):
             else:
                 delta_text = "N/A"
             
+            # 三欄指標卡片
             m1, m2, m3 = st.columns(3)
             m1.metric("現價", f"${res['現價']}", delta=delta_text, delta_color=delta_color)
             m2.metric("Fib 0.618", f"${res['Fib 0.618']}")
@@ -719,18 +672,6 @@ def render_results(results: List[Dict[str, Any]]):
                 f"**價格來源**：{res['來源']}"
             )
             
-            # 新聞區域
-            news_list = res.get('news', [])
-            if news_list:
-                st.markdown("### 📰 最新個股新聞")
-                for i, news in enumerate(news_list, 1):
-                    news_type_emoji = "🟢" if news['type'] == '利好' else "🔴" if news['type'] == '利空' else "⚪"
-                    with st.container():
-                        st.markdown(f"**{i}. {news_type_emoji} [{news['type']}]** {news['title']}")
-                        st.caption(f"🕒 {news['time']} | 📰 {news['publisher']}")
-                        if news['link']:
-                            st.markdown(f"[🔗 閱讀全文]({news['link']})")
-                        st.divider()
             
             # 壓力測試情景
             scenarios_df = generate_scenarios(
@@ -739,8 +680,6 @@ def render_results(results: List[Dict[str, Any]]):
                 res["_d_h"],
                 res["trends"]
             )
-            
-            # 自定義情景表格樣式
             st.table(scenarios_df)
 
 
@@ -748,7 +687,7 @@ def main():
     """主函數"""
     raw_input = st.text_input(
         "輸入股票代碼 (支援空格/逗號分隔):",
-        value="BA, NVDA, TSLA",
+        value="TSLA",
         help="例如：AAPL, MSFT, GOOGL 或 AAPL MSFT GOOGL"
     )
     
