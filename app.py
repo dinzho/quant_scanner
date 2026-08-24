@@ -8,466 +8,762 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Dict, List, Any, Tuple
 from datetime import datetime, timedelta
 import logging
-import requests
-import time
 from dateutil import parser as date_parser
+import time
 
 # ------------------------------------------------------------------------------
 # 配置與常量定義
 # ------------------------------------------------------------------------------
 warnings.filterwarnings('ignore')
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# 日誌配置
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # 常量定義
-MAX_TICKERS = 50
-REQUEST_TIMEOUT = 30
-CACHE_TTL_HISTORY = 600
-CACHE_TTL_PRICE = 60
-CACHE_TTL_NEWS = 300
-MIN_DATA_POINTS = 60
-VOL_SPIKE_THRESHOLD = 1.5
-EMA_PERIOD = 20
+MAX_TICKERS = 50  # 最大股票數量限制
+REQUEST_TIMEOUT = 45  # API 請求超時時間 (秒)
+CACHE_TTL_HISTORY = 300  # 歷史數據快取時間 (秒)
+CACHE_TTL_PRICE = 60  # 實時價格快取時間 (秒)
+CACHE_TTL_NEWS = 120  # 新聞數據快取時間 (秒)
+MIN_DATA_POINTS = 60  # 最小數據點要求
+VOL_SPIKE_THRESHOLD = 1.5  # 成交量放大倍數閾值
+EMA_PERIOD = 20  # EMA 週期
 
-FIB_LEVELS = {'0': 0.0, '382': 0.382, '500': 0.500, '618': 0.618, '786': 0.786, '1000': 1.0}
+# FIB 黃金分割位
+FIB_LEVELS = {
+    '0': 0.0,
+    '382': 0.382,
+    '500': 0.500,
+    '618': 0.618,
+    '786': 0.786,
+    '1000': 1.0
+}
+
+# 新聞快取字典
 NEWS_CACHE = {}
 
-st.set_page_config(page_title="多週期量化策略掃描器", page_icon="📈", layout="wide", initial_sidebar_state="collapsed")
+# 頁面配置
+st.set_page_config(
+    page_title="多週期量化策略掃描器",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
+
 st.title("📈 多週期波浪形態量化策略掃描器")
-st.caption("Finnhub (歷史) + Yahoo (實時) | 自動降級備援機制")
+st.caption("道氏趨勢 + FIB 黃金口袋區 + 多週期共振 (月/周/日/小時)")
+
 
 # ------------------------------------------------------------------------------
-# 側邊欄：API Key 配置與驗證
-# ------------------------------------------------------------------------------
-with st.sidebar:
-    st.header("⚙️ API 配置")
-    
-    # 自動去除首尾空格
-    finnhub_key_input = st.text_input(
-        "Finnhub API Key",
-        type="password",
-        help="請確保已驗證電子郵件。若報 403，請檢查信箱或重新生成 Key。",
-        placeholder="cxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-    )
-    
-    if finnhub_key_input:
-        finnhub_key = finnhub_key_input.strip() # 關鍵修復：去除空格
-        st.session_state['FINNHUB_KEY'] = finnhub_key
-        
-        # 測試連線按鈕
-        if st.button("🧪 測試連線", use_container_width=True):
-            with st.spinner("測試中..."):
-                test_url = "https://finnhub.io/api/v1/stock/candle"
-                test_params = {'symbol': 'AAPL', 'resolution': 'D', 'from': int(time.time())-86400, 'to': int(time.time()), 'token': finnhub_key}
-                try:
-                    resp = requests.get(test_url, params=test_params, timeout=10)
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        if data.get('s') == 'ok':
-                            st.success("✅ 連線成功！API Key 有效。")
-                        else:
-                            st.error(f"❌ API 返回異常：{data.get('s')}")
-                    elif resp.status_code == 401:
-                        st.error("❌ 401 錯誤：Key 無效或已註銷。")
-                    elif resp.status_code == 403:
-                        st.error("❌ 403 錯誤：常見原因\n1. 未驗證電子郵件\n2. Key 複製錯誤\n3. 賬戶被凍結")
-                        st.info("💡 解決方法：請登入 Finnhub 檢查郵箱驗證狀態，或在 Dashboard 重新生成 Key。")
-                    elif resp.status_code == 429:
-                        st.warning("⚠️ 429 錯誤：請求過於頻繁，請等待 1 分鐘後重試。")
-                    else:
-                        st.error(f"❌ 未知錯誤：{resp.status_code}")
-                except Exception as e:
-                    st.error(f"網路錯誤：{str(e)}")
-        
-        st.success("✅ API Key 已載入")
-    else:
-        st.warning("⚠️ 請輸入 Finnhub API Key")
-        if 'FINNHUB_KEY' in st.session_state:
-            del st.session_state['FINNHUB_KEY']
-
-    st.markdown("---")
-    st.info("💡 **架構說明**:\n- **優先**: Finnhub (日/周/月線)\n- **備選**: Yahoo Finance (當 Finnhub 失敗時)\n- **實時**: Yahoo Finance")
-
-# ------------------------------------------------------------------------------
-# 輸入驗證
+# 輸入驗證與安全防護
 # ------------------------------------------------------------------------------
 def validate_ticker(ticker: str) -> bool:
-    if not ticker or not isinstance(ticker, str): return False
-    return bool(re.match(r'^[A-Z0-9.\-]{1,10}$', ticker.strip().upper()))
+    """驗證股票代碼格式"""
+    if not ticker or not isinstance(ticker, str):
+        return False
+    ticker = ticker.strip().upper()
+    pattern = r'^[A-Z0-9.\-]{1,10}$'
+    return bool(re.match(pattern, ticker))
+
 
 def parse_tickers(raw_input: str) -> List[str]:
-    if not raw_input: return []
+    """解析並驗證股票代碼列表"""
+    if not raw_input or not isinstance(raw_input, str):
+        return []
+    
     raw_tickers = re.split(r'[,\s,]+', raw_input)
-    valid = [t.strip().upper() for t in raw_tickers if validate_ticker(t)]
-    if len(valid) > MAX_TICKERS:
-        st.warning(f"已截斷至 {MAX_TICKERS} 個代碼")
-        valid = valid[:MAX_TICKERS]
-    return list(dict.fromkeys(valid)) # 去重
+    
+    valid_tickers = []
+    for t in raw_tickers:
+        t_clean = t.strip().upper()
+        if t_clean and validate_ticker(t_clean):
+            if t_clean not in valid_tickers:
+                valid_tickers.append(t_clean)
+    
+    if len(valid_tickers) > MAX_TICKERS:
+        st.warning(f"最多只支持 {MAX_TICKERS} 個股票代碼，已自動截斷。")
+        valid_tickers = valid_tickers[:MAX_TICKERS]
+    
+    return valid_tickers
+
 
 # ------------------------------------------------------------------------------
-# 數據抓取模組 (混合架構 + 降級機制)
+# 快取優化：分離歷史數據和實時價格
 # ------------------------------------------------------------------------------
-def fetch_finnhub_history(ticker: str, resolution: str, days: int) -> Optional[pd.DataFrame]:
-    api_key = st.session_state.get('FINNHUB_KEY')
-    if not api_key: return None
-    
-    end_time = int(time.time())
-    start_time = end_time - (days * 24 * 60 * 60)
-    
-    url = "https://finnhub.io/api/v1/stock/candle"
-    params = {'symbol': ticker, 'resolution': resolution, 'from': start_time, 'to': end_time, 'token': api_key}
-    
-    for attempt in range(3):
-        try:
-            resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get('s') == 'ok':
-                    df = pd.DataFrame({'Open': data['o'], 'High': data['h'], 'Low': data['l'], 'Close': data['c'], 'Volume': data['v']})
-                    df.index = pd.to_datetime(data['t'], unit='s')
-                    return df
-                else:
-                    return None # 數據為空
-            elif resp.status_code in [401, 403]:
-                logger.error(f"{ticker}: API Key 無效 (401/403)")
-                return None # Key 錯誤，不再重試
-            elif resp.status_code == 429:
-                wait = (attempt + 1) * 2
-                time.sleep(wait)
-            else:
-                return None
-        except Exception as e:
-            logger.error(f"{ticker}: 請求異常 - {str(e)}")
-            if attempt < 2: time.sleep(2)
-    return None
-
-def fetch_yf_backup_history(ticker: str, period: str, interval: str) -> Optional[pd.DataFrame]:
-    """Yahoo Finance 備用方案"""
-    try:
-        tk = yf.Ticker(ticker)
-        df = tk.history(period=period, interval=interval, timeout=15)
-        if df is not None and not df.empty:
-            # 重整欄位名稱以匹配 Finnhub 格式
-            df = df.rename(columns={'Open':'Open', 'High':'High', 'Low':'Low', 'Close':'Close', 'Volume':'Volume'})
-            return df
-    except Exception as e:
-        logger.warning(f"{ticker}: YF 備用抓取失敗 - {str(e)}")
-    return None
-
 @st.cache_data(ttl=CACHE_TTL_HISTORY, show_spinner=False)
 def fetch_multi_period_data(ticker_symbol: str) -> Optional[Dict[str, pd.DataFrame]]:
-    if 'FINNHUB_KEY' not in st.session_state:
-        # 若無 Key，直接嘗試全用 YF
-        pass
-    
-    has_key = 'FINNHUB_KEY' in st.session_state
-    
-    # 1. 日線 (優先 Finnhub 365 天)
-    df_daily = fetch_finnhub_history(ticker_symbol, 'D', 365) if has_key else None
-    if df_daily is None:
-        logger.info(f"{ticker_symbol}: Finnhub 日線失敗，切換至 Yahoo Finance")
-        df_daily = fetch_yf_backup_history(ticker_symbol, "1y", "1d")
-    
-    if df_daily is None or len(df_daily) < MIN_DATA_POINTS:
-        return None
-    
-    # 2. 周線 (優先 Finnhub 2 年)
-    df_weekly = fetch_finnhub_history(ticker_symbol, 'W', 730) if has_key else None
-    if df_weekly is None or df_weekly.empty:
-        df_weekly = fetch_yf_backup_history(ticker_symbol, "2y", "1wk")
-    
-    # 3. 月線 (優先 Finnhub 5 年)
-    df_monthly = fetch_finnhub_history(ticker_symbol, 'M', 1825) if has_key else None
-    if df_monthly is None or df_monthly.empty:
-        df_monthly = fetch_yf_backup_history(ticker_symbol, "5y", "3mo")
-    
-    # 4. 小時線 (優先 Finnhub 90 天)
-    df_hourly = fetch_finnhub_history(ticker_symbol, '60', 90) if has_key else None
-    if df_hourly is None or df_hourly.empty:
-        # YF 小時線只能抓最近 30 天
-        df_hourly = fetch_yf_backup_history(ticker_symbol, "1mo", "1h")
-
-    return {
-        "monthly": df_monthly if df_monthly is not None else pd.DataFrame(),
-        "weekly": df_weekly if df_weekly is not None else pd.DataFrame(),
-        "daily": df_daily,
-        "hourly": df_hourly if df_hourly is not None else pd.DataFrame()
-    }
-
-@st.cache_data(ttl=CACHE_TTL_PRICE, show_spinner=False)
-def fetch_yf_price(ticker_symbol: str) -> Optional[Dict[str, Any]]:
+    """抓取多週期歷史 K 線數據（月/周/日/小時）"""
     try:
         ticker = yf.Ticker(ticker_symbol)
-        info = ticker.info or {}
-        curr_price = None
-        prev_close = info.get("previousClose")
-        source = "失敗"
         
-        state = info.get("marketState", "").upper()
-        if state == "PRE" and info.get("preMarketPrice"):
-            curr_price = float(info["preMarketPrice"]); source = "盤前"
-        elif state == "POST" and info.get("postMarketPrice"):
-            curr_price = float(info["postMarketPrice"]); source = "盤後"
-        elif info.get("regularMarketPrice"):
-            curr_price = float(info["regularMarketPrice"]); source = "常規"
+        # 抓取多週期數據
+        df_monthly = ticker.history(period="5y", interval="3mo")  # 月線
+        df_weekly = ticker.history(period="2y", interval="1wk")   # 周線
+        df_daily = ticker.history(period="1y", interval="1d")     # 日線
+        df_hourly = ticker.history(period="1mo", interval="1h", prepost=True)  # 小時線
         
-        if curr_price is None:
-            df_1m = ticker.history(period="1d", interval="1m", prepost=True, timeout=10)
-            if df_1m is not None and not df_1m.empty:
-                curr_price = float(df_1m['Close'].iloc[-1])
-                source = "1 分 K"
-                if prev_close is None:
-                    df_1d = ticker.history(period="5d", interval="1d", timeout=10)
-                    if df_1d is not None and len(df_1d) >= 2: prev_close = df_1d['Close'].iloc[-2]
+        # 數據質量檢查
+        if df_daily is None or len(df_daily) < MIN_DATA_POINTS:
+            logger.warning(f"{ticker_symbol}: 日線數據不足")
+            return None
+        
+        return {
+            "monthly": df_monthly if df_monthly is not None and not df_monthly.empty else pd.DataFrame(),
+            "weekly": df_weekly if df_weekly is not None and not df_weekly.empty else pd.DataFrame(),
+            "daily": df_daily,
+            "hourly": df_hourly if df_hourly is not None and not df_hourly.empty else pd.DataFrame()
+        }
+    
+    except Exception as e:
+        logger.error(f"{ticker_symbol}: 歷史數據抓取失敗 - {str(e)}")
+        return None
 
-        if curr_price is None: return None
-        
-        change_amt = round(curr_price - prev_close, 2) if prev_close else 0
-        change_pct = round((change_amt / prev_close) * 100, 2) if prev_close else 0
-        
-        return {"price": curr_price, "prev_close": prev_close, "change_amount": change_amt, "change_percent": change_pct, "source": source}
+
+@st.cache_data(ttl=CACHE_TTL_PRICE, show_spinner=False)
+def fetch_current_price(ticker_symbol: str) -> Optional[Dict[str, Any]]:
+    """抓取當前價格和漲跌幅"""
+    try:
+        ticker = yf.Ticker(ticker_symbol)
+        curr_price = None
+        prev_close = None
+        source = "失敗"
+
+        try:
+            info = ticker.info or {}
+            state = info.get("marketState", "").upper()
+            prev_close = info.get("previousClose")
+            
+            if state == "PRE" and info.get("preMarketPrice"):
+                curr_price = float(info["preMarketPrice"])
+                source = "盤前"
+            elif state == "POST" and info.get("postMarketPrice"):
+                curr_price = float(info["postMarketPrice"])
+                source = "盤後"
+            elif info.get("regularMarketPrice"):
+                curr_price = float(info["regularMarketPrice"])
+                source = "常規"
+        except (ValueError, TypeError, KeyError):
+            pass
+
+        if curr_price is None:
+            try:
+                df_1m = ticker.history(period="1d", interval="1m", prepost=True)
+                if df_1m is not None and not df_1m.empty:
+                    close_series = df_1m['Close'].dropna()
+                    if not close_series.empty:
+                        curr_price = float(close_series.iloc[-1])
+                        source = "1 分 K"
+                        df_1d = ticker.history(period="5d", interval="1d")
+                        if df_1d is not None and len(df_1d) >= 2:
+                            prev_close = df_1d['Close'].iloc[-2]
+            except Exception:
+                pass
+
+        if curr_price is None:
+            return None
+
+        change_percent = None
+        change_amount = None
+        if prev_close and prev_close > 0:
+            change_amount = round(curr_price - prev_close, 2)
+            change_percent = round((change_amount / prev_close) * 100, 2)
+
+        return {
+            "price": curr_price,
+            "prev_close": prev_close,
+            "change_amount": change_amount,
+            "change_percent": change_percent,
+            "source": source
+        }
+
     except Exception as e:
         logger.error(f"{ticker_symbol}: 價格抓取失敗 - {str(e)}")
         return None
 
+
 # ------------------------------------------------------------------------------
-# 技術分析模組 (保持不變)
+# 技術分析模組：多週期波浪與道氏理論
 # ------------------------------------------------------------------------------
 def identify_trend_direction(df: pd.DataFrame, period_name: str) -> str:
-    if df is None or len(df) < 20: return "數據不足"
+    """
+    使用道氏理論判斷趨勢方向
+    返回: '上漲', '下跌', '盤整'
+    """
+    if df is None or len(df) < 20:
+        return "數據不足"
+    
     try:
-        h, l = df['High'].values, df['Low'].values
-        rh, rl = h[-10:], l[-10:]
-        hh = sum(1 for i in range(1, len(rh)) if rh[i] > rh[i-1])
-        hl = sum(1 for i in range(1, len(rl)) if rl[i] > rl[i-1])
-        lh = sum(1 for i in range(1, len(rh)) if rh[i] < rh[i-1])
-        ll = sum(1 for i in range(1, len(rl)) if rl[i] < rl[i-1])
-        if hh >= 6 and hl >= 6: return "上漲"
-        if lh >= 6 and ll >= 6: return "下跌"
-        return "盤整"
-    except: return "無法判斷"
+        highs = df['High'].values
+        lows = df['Low'].values
+        
+        recent_highs = highs[-10:]
+        recent_lows = lows[-10:]
+        
+        hh_count = sum(1 for i in range(1, len(recent_highs)) if recent_highs[i] > recent_highs[i-1])
+        hl_count = sum(1 for i in range(1, len(recent_lows)) if recent_lows[i] > recent_lows[i-1])
+        
+        lh_count = sum(1 for i in range(1, len(recent_highs)) if recent_highs[i] < recent_highs[i-1])
+        ll_count = sum(1 for i in range(1, len(recent_lows)) if recent_lows[i] < recent_lows[i-1])
+        
+        if hh_count >= 6 and hl_count >= 6:
+            return "上漲"
+        elif lh_count >= 6 and ll_count >= 6:
+            return "下跌"
+        else:
+            return "盤整"
+            
+    except Exception as e:
+        logger.warning(f"{period_name} 趨勢判斷失敗: {str(e)}")
+        return "無法判斷"
+
 
 def identify_wave_stage(df: pd.DataFrame, trend: str, period_name: str) -> str:
-    if df is None or len(df) < 20: return "數據不足"
+    """
+    識別波浪階段 (推動浪/回調浪/盤整)
+    """
+    if df is None or len(df) < 20:
+        return "數據不足"
+    
     try:
         ma20 = df['Close'].rolling(20).mean().iloc[-1]
         ma50 = df['Close'].rolling(50).mean().iloc[-1] if len(df) >= 50 else ma20
-        cp = df['Close'].iloc[-1]
+        current_price = df['Close'].iloc[-1]
+        
         if trend == "上漲":
-            if cp > ma20 > ma50: return "推動浪 (主升)"
-            if ma50 < cp < ma20: return "回調浪 (次級)"
-            return "盤整延伸"
-        if trend == "下跌":
-            if cp < ma20 < ma50: return "推動浪 (主跌)"
-            if ma50 > cp > ma20: return "回調浪 (反彈)"
-            return "盤整延伸"
-        return "橫向盤整"
-    except: return "無法判斷"
+            if current_price > ma20 > ma50:
+                return "推動浪 (主升)"
+            elif ma50 < current_price < ma20:
+                return "回調浪 (次級)"
+            else:
+                return "盤整延伸"
+                
+        elif trend == "下跌":
+            if current_price < ma20 < ma50:
+                return "推動浪 (主跌)"
+            elif ma50 > current_price > ma20:
+                return "回調浪 (反彈)"
+            else:
+                return "盤整延伸"
+        else:
+            return "橫向盤整"
+            
+    except Exception as e:
+        logger.warning(f"{period_name} 波浪階段判斷失敗: {str(e)}")
+        return "無法判斷"
+
 
 def calculate_fib_zones(df_daily: pd.DataFrame, curr_price: float) -> Dict[str, float]:
-    if df_daily is None or len(df_daily) < 60: return {}
-    recent = df_daily.tail(60)
-    high = max(recent['High'].max(), curr_price)
-    low = min(recent['Low'].min(), curr_price)
-    rng = high - low
-    zones = {f'fib_{k}': high - v * rng for k, v in FIB_LEVELS.items()}
-    zones.update({'daily_high': high, 'daily_low': low})
-    return zones
+    """計算 FIB 黃金分割區域"""
+    if df_daily is None or len(df_daily) < 60:
+        return {}
+    
+    daily_recent = df_daily.tail(60)
+    daily_high = max(daily_recent['High'].max(), curr_price)
+    daily_low = min(daily_recent['Low'].min(), curr_price)
+    
+    price_range = daily_high - daily_low
+    
+    fib_zones = {}
+    for name, level in FIB_LEVELS.items():
+        fib_zones[f'fib_{name}'] = daily_high - level * price_range
+    
+    fib_zones['daily_high'] = daily_high
+    fib_zones['daily_low'] = daily_low
+    
+    return fib_zones
+
 
 def check_hourly_signal(df_hourly: pd.DataFrame, curr_price: float, fib_786: float) -> Tuple[bool, float]:
-    if df_hourly is None or len(df_hourly) < 20: return False, round(fib_786 * 0.98, 2)
+    """檢查小時線交易訊號 (EMA 突破 + 成交量)"""
+    if df_hourly is None or len(df_hourly) < 20:
+        return False, round(fib_786 * 0.98, 2)
+    
     try:
-        df_h = df_hourly.copy()
-        df_h['EMA20'] = df_h['Close'].ewm(span=EMA_PERIOD, adjust=False).mean()
-        df_h['Vol_MA'] = df_h['Volume'].rolling(20).mean()
-        if len(df_h) < 2: return False, round(fib_786 * 0.98, 2)
+        df_hourly = df_hourly.copy()
         
-        c_prev, ema_prev = df_h['Close'].iloc[-2], df_h['EMA20'].iloc[-2]
-        ema_curr, vol_curr = df_h['EMA20'].iloc[-1], df_h['Volume'].iloc[-1]
-        vol_ma = df_h['Vol_MA'].iloc[-1]
+        df_hourly['EMA20'] = df_hourly['Close'].ewm(span=EMA_PERIOD, adjust=False).mean()
+        df_hourly['Vol_MA'] = df_hourly['Volume'].rolling(20).mean()
         
-        if any(pd.isna([c_prev, ema_prev, ema_curr, vol_curr, vol_ma])): return False, round(fib_786 * 0.98, 2)
+        if len(df_hourly) < 2:
+            return False, round(fib_786 * 0.98, 2)
         
-        breakout = (c_prev <= ema_prev) and (curr_price > ema_curr)
-        vol_spike = vol_curr > (vol_ma * VOL_SPIKE_THRESHOLD)
+        c_prev = df_hourly['Close'].iloc[-2]
+        ema_prev = df_hourly['EMA20'].iloc[-2]
+        ema_curr = df_hourly['EMA20'].iloc[-1]
+        vol_curr = df_hourly['Volume'].iloc[-1]
+        vol_prev = df_hourly['Volume'].iloc[-2]
+        vol_ma = df_hourly['Vol_MA'].iloc[-1]
         
-        triggered = bool(breakout and vol_spike)
-        stop = round(min(df_h['Low'].tail(15).min(), fib_786) * 0.99, 2)
-        return triggered, stop
-    except: return False, round(fib_786 * 0.98, 2)
+        if any(pd.isna([c_prev, ema_prev, ema_curr, vol_curr, vol_prev, vol_ma])):
+            return False, round(fib_786 * 0.98, 2)
+        
+        h_breakout = (c_prev <= ema_prev) and (curr_price > ema_curr)
+        h_vol_spike = max(vol_curr, vol_prev) > (vol_ma * VOL_SPIKE_THRESHOLD)
+        
+        hourly_triggered = bool(h_breakout and h_vol_spike)
+        
+        hourly_low_min = df_hourly['Low'].tail(15).min()
+        hourly_stop_loss = round(min(hourly_low_min, fib_786) * 0.99, 2)
+        
+        return hourly_triggered, hourly_stop_loss
+    
+    except Exception as e:
+        logger.warning(f"小時線訊號計算失敗：{str(e)}")
+        return False, round(fib_786 * 0.98, 2)
+
 
 def calculate_confidence_score(trends: Dict[str, str], in_fib_zone: bool, hourly_triggered: bool) -> str:
+    """計算策略信心等級"""
     score = 0
-    vals = list(trends.values())
-    if len(set(vals)) == 1 and vals[0] == "上漲": score += 3
-    elif vals.count("上漲") >= 2: score += 2
-    if in_fib_zone: score += 2
-    if hourly_triggered: score += 2
-    return "高" if score >= 6 else ("中" if score >= 4 else "低")
+    
+    trend_values = list(trends.values())
+    if len(set(trend_values)) == 1 and trend_values[0] == "上漲":
+        score += 3
+    elif trend_values.count("上漲") >= 2:
+        score += 2
+    
+    if in_fib_zone:
+        score += 2
+    
+    if hourly_triggered:
+        score += 2
+    
+    if score >= 6:
+        return "高"
+    elif score >= 4:
+        return "中"
+    else:
+        return "低"
 
-def determine_strategy(trends: Dict[str, str], in_fib_zone: bool, hourly_triggered: bool, confidence: str) -> Dict[str, str]:
-    m, w, d = trends.get("monthly", ""), trends.get("weekly", ""), trends.get("daily", "")
-    if m == "上漲" and w == "上漲" and in_fib_zone and hourly_triggered:
-        return {"strategy": "🚀 大主升浪起場點 (多週期共振)", "position": "70% - 100%", "color": "green"}
-    if w == "上漲" and d == "上漲" and in_fib_zone:
-        return {"strategy": "📈 中線波段建倉 (趨勢跟隨)", "position": "40% - 60%", "color": "blue"}
-    if in_fib_zone and hourly_triggered:
-        return {"strategy": "⚡ 短線衝刺/反彈 (技術訊號)", "position": "20% - 30%", "color": "orange"}
-    if hourly_triggered and confidence == "高":
-        return {"strategy": "⚡ 短線試單 (高信心)", "position": "15% - 25%", "color": "orange"}
-    return {"strategy": "👀 觀察中 (等待點位)", "position": "0%", "color": "gray"}
 
-def fetch_news(ticker: str) -> List[Dict[str, Any]]:
+def determine_strategy(trends: Dict[str, str], in_fib_zone: bool, 
+                      hourly_triggered: bool, curr_price: float, 
+                      fib_618: float, confidence: str) -> Dict[str, str]:
+    """根據多週期分析決定交易策略"""
+    
+    monthly_trend = trends.get("monthly", "")
+    weekly_trend = trends.get("weekly", "")
+    daily_trend = trends.get("daily", "")
+    
+    if monthly_trend == "上漲" and weekly_trend == "上漲" and in_fib_zone and hourly_triggered:
+        return {
+            "strategy": "🚀 大主升浪起場點 (多週期共振)",
+            "position": "70% - 100%",
+            "color": "green"
+        }
+    elif weekly_trend == "上漲" and daily_trend == "上漲" and in_fib_zone:
+        return {
+            "strategy": "📈 中線波段建倉 (趨勢跟隨)",
+            "position": "40% - 60%",
+            "color": "blue"
+        }
+    elif in_fib_zone and hourly_triggered:
+        return {
+            "strategy": "⚡ 短線衝刺/反彈 (技術訊號)",
+            "position": "20% - 30%",
+            "color": "orange"
+        }
+    elif hourly_triggered and confidence == "高":
+        return {
+            "strategy": "⚡ 短線試單 (高信心)",
+            "position": "15% - 25%",
+            "color": "orange"
+        }
+    else:
+        return {
+            "strategy": "👀 觀察中 (等待點位)",
+            "position": "0%",
+            "color": "gray"
+        }
+
+
+# ------------------------------------------------------------------------------
+# 新聞模組 (已修復)
+# ------------------------------------------------------------------------------
+def fetch_news(ticker_symbol: str) -> List[Dict[str, Any]]:
+    """抓取個股新聞 (修復版：直接解析 yfinance 標準結構)"""
     try:
-        key = f"{ticker}_{datetime.now().strftime('%Y-%m-%d_%H')}"
-        if key in NEWS_CACHE:
-            t, news = NEWS_CACHE[key]
-            if (datetime.now() - t).total_seconds() < CACHE_TTL_NEWS: return news
+        cache_key = f"{ticker_symbol}_{datetime.now().strftime('%Y-%m-%d_%H')}"
+        if cache_key in NEWS_CACHE:
+            cache_time, cached_news = NEWS_CACHE[cache_key]
+            if (datetime.now() - cache_time).total_seconds() < CACHE_TTL_NEWS:
+                return cached_news
         
-        items = yf.Ticker(ticker).news
-        news = []
-        if items:
-            for item in items[:5]:
-                title = item.get("title", "")
-                txt = (title + " " + item.get("summary", "")).lower()
-                typ = "中性"
-                if any(w in txt for w in ['beat', 'surge', 'gain', 'up', 'rise', 'buy', 'upgrade', 'record', 'profit']): typ = "利好"
-                elif any(w in txt for w in ['miss', 'drop', 'fall', 'down', 'sell', 'downgrade', 'lawsuit', 'loss', 'warning']): typ = "利空"
-                
-                pt = item.get("providerPublishTime")
-                ts = datetime.fromtimestamp(pt).strftime("%Y-%m-%d %H:%M") if pt else "未知"
-                news.append({"title": title, "publisher": item.get("publisher", "?"), "link": item.get("link", ""), "time": ts, "type": typ})
+        ticker = yf.Ticker(ticker_symbol)
+        news_list = []
         
-        if news: NEWS_CACHE[key] = (datetime.now(), news)
-        return news
-    except: return []
+        try:
+            # yfinance 返回的新聞列表通常是字典列表
+            news_items = ticker.news
+            if news_items and isinstance(news_items, list):
+                for item in news_items[:5]:
+                    if not isinstance(item, dict):
+                        continue
+                        
+                    # 安全獲取字段
+                    title = item.get("title", "無標題")
+                    publisher = item.get("publisher", "未知來源")
+                    link = item.get("link", "")
+                    
+                    # 處理時間
+                    pub_time = item.get("providerPublishTime")
+                    time_str = "未知時間"
+                    if pub_time:
+                        try:
+                            time_str = datetime.fromtimestamp(pub_time).strftime("%Y-%m-%d %H:%M")
+                        except:
+                            time_str = "格式錯誤"
+                    
+                    # 情感分析 (標題 + 摘要如果有)
+                    text_content = (title + " " + item.get("summary", "")).lower()
+                    
+                    news_type = "中性"
+                    positive_words = ['beat', 'surge', 'gain', 'up', 'rise', 'buy', 'upgrade', 'record', 'profit', 'strong', 'growth', 'soar', 'jump']
+                    negative_words = ['miss', 'drop', 'fall', 'down', 'sell', 'downgrade', 'lawsuit', 'loss', 'warning', 'weak', 'decline', 'slump', 'cut']
+                    
+                    if any(word in text_content for word in positive_words):
+                        news_type = "利好"
+                    elif any(word in text_content for word in negative_words):
+                        news_type = "利空"
+                    
+                    news_entry = {
+                        "title": title,
+                        "publisher": publisher,
+                        "link": link,
+                        "time": time_str,
+                        "type": news_type
+                    }
+                    news_list.append(news_entry)
+        except Exception as e:
+            logger.debug(f"{ticker_symbol}: 新聞解析細節錯誤 - {str(e)}")
+        
+        if news_list:
+            NEWS_CACHE[cache_key] = (datetime.now(), news_list)
+        
+        return news_list
+    
+    except Exception as e:
+        logger.error(f"{ticker_symbol}: 新聞抓取異常 - {str(e)}")
+        return []
 
+
+# ------------------------------------------------------------------------------
+# 核心分析函數
+# ------------------------------------------------------------------------------
 def analyze_single_stock(ticker: str) -> Optional[Dict[str, Any]]:
+    """分析單支股票（完整多週期流程）"""
     try:
-        hist = fetch_multi_period_data(ticker)
-        price = fetch_yf_price(ticker)
+        historical_data = fetch_multi_period_data(ticker)
+        price_data = fetch_current_price(ticker)
         
-        if hist is None or price is None:
-            logger.warning(f"{ticker}: 數據不完整")
+        if historical_data is None or price_data is None:
+            logger.warning(f"{ticker}: 數據不完整，跳過分析")
             return None
         
-        curr = price["price"]
-        df_hourly = hist["hourly"] if not hist["hourly"].empty else pd.DataFrame()
+        curr_price = price_data["price"]
+        change_percent = price_data.get("change_percent")
+        change_amount = price_data.get("change_amount")
+        source = price_data["source"]
         
-        trends = {p: identify_trend_direction(hist[p], n) for p, n in [("monthly", "月線"), ("weekly", "周線"), ("daily", "日線"), ("hourly", "小時線")]}
-        stages = {p: identify_wave_stage(hist[p], trends[p], n) for p, n in [("monthly", "月線"), ("weekly", "周線"), ("daily", "日線"), ("hourly", "小時線")]}
+        df_monthly = historical_data["monthly"]
+        df_weekly = historical_data["weekly"]
+        df_daily = historical_data["daily"]
+        df_hourly = historical_data["hourly"]
         
-        fib = calculate_fib_zones(hist["daily"], curr)
-        f618, f786, d_high = fib.get('fib_618', 0), fib.get('fib_786', 0), fib.get('daily_high', curr)
+        # 1. 多週期趨勢判斷
+        trends = {
+            "monthly": identify_trend_direction(df_monthly, "月線"),
+            "weekly": identify_trend_direction(df_weekly, "周線"),
+            "daily": identify_trend_direction(df_daily, "日線"),
+            "hourly": identify_trend_direction(df_hourly, "小時線")
+        }
         
-        in_zone = (curr >= f786 * 0.99) and (curr <= f618 * 1.01)
-        triggered, stop = check_hourly_signal(df_hourly, curr, f786)
-        conf = calculate_confidence_score(trends, in_zone, triggered)
-        strat = determine_strategy(trends, in_zone, triggered, conf)
-        news = fetch_news(ticker)
-        dist = round(((curr - f618) / f618) * 100, 2) if f618 > 0 else 0
+        # 2. 波浪階段識別
+        wave_stages = {
+            "monthly": identify_wave_stage(df_monthly, trends["monthly"], "月線"),
+            "weekly": identify_wave_stage(df_weekly, trends["weekly"], "周線"),
+            "daily": identify_wave_stage(df_daily, trends["daily"], "日線"),
+            "hourly": identify_wave_stage(df_hourly, trends["hourly"], "小時線")
+        }
+        
+        # 3. 計算 FIB 黃金分割區
+        fib_data = calculate_fib_zones(df_daily, curr_price)
+        fib_618 = fib_data.get('fib_618', 0)
+        fib_786 = fib_data.get('fib_786', 0)
+        daily_high = fib_data.get('daily_high', curr_price)
+        
+        # 4. 判斷是否在 FIB 黃金口袋區
+        in_fib_zone = (curr_price >= fib_786 * 0.99) and (curr_price <= fib_618 * 1.01)
+        
+        # 5. 小時線訊號檢測
+        hourly_triggered, hourly_stop_loss = check_hourly_signal(df_hourly, curr_price, fib_786)
+        
+        # 6. 計算信心等級
+        confidence = calculate_confidence_score(trends, in_fib_zone, hourly_triggered)
+        
+        # 7. 確定策略
+        strategy_info = determine_strategy(trends, in_fib_zone, hourly_triggered, curr_price, fib_618, confidence)
+        
+        # 8. 獲取新聞
+        news_list = fetch_news(ticker)
+        
+        # 9. 計算距離百分比
+        dist_618 = round(((curr_price - fib_618) / fib_618) * 100, 2) if fib_618 > 0 else 0
         
         return {
-            "代碼": ticker, "現價": round(curr, 2), "漲跌額": price.get("change_amount"),
-            "漲跌幅": price.get("change_percent"), "來源": price["source"],
-            "建議策略": strat["strategy"], "建議倉位": strat["position"],
-            "Fib 0.618": round(f618, 2), "距 0.618(%)": f"{dist}%", "止損價": stop,
-            "color": strat["color"], "confidence": conf, "news": news,
-            "trends": trends, "wave_stages": stages, "_d_h": d_high,
-            "_d_l": fib.get('daily_low', 0), "_f618": f618, "_f786": f786
+            "代碼": ticker,
+            "現價": round(curr_price, 2),
+            "漲跌額": change_amount,
+            "漲跌幅": change_percent,
+            "來源": source,
+            "建議策略": strategy_info["strategy"],
+            "建議倉位": strategy_info["position"],
+            "Fib 0.618": round(fib_618, 2),
+            "距 0.618(%)": f"{dist_618}%",
+            "止損價": hourly_stop_loss,
+            "color": strategy_info["color"],
+            "confidence": confidence,
+            "news": news_list,
+            "trends": trends,
+            "wave_stages": wave_stages,
+            "_d_h": daily_high,
+            "_d_l": fib_data.get('daily_low', 0),
+            "_f618": fib_618,
+            "_f786": fib_786
         }
+    
     except Exception as e:
-        logger.error(f"{ticker}: 分析失敗 - {str(e)}")
+        logger.error(f"{ticker}: 分析過程失敗 - {str(e)}")
         return None
 
-def analyze_stocks_parallel(tickers: List[str], max_workers: int = 3) -> List[Dict[str, Any]]:
-    res = []
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = {ex.submit(analyze_single_stock, t): t for t in tickers}
-        for f in as_completed(futs):
-            try:
-                r = f.result(timeout=45)
-                if r: res.append(r)
-            except Exception as e:
-                logger.error(f"{futs[f]}: 超時 - {str(e)}")
-    return res
 
-def generate_scenarios(f618, f786, d_h, trends):
-    m, w, d = trends.get("monthly", ""), trends.get("weekly", ""), trends.get("daily", "")
-    s1_cond = (m == "上漲" or w == "上漲")
-    s3_cond = (d == "上漲" and w == "上漲")
+def analyze_stocks_parallel(tickers: List[str], max_workers: int = 5) -> List[Dict[str, Any]]:
+    """並行分析多支股票"""
+    results = []
     
-    return pd.DataFrame([
-        {"情境": "1. 回測 FIB 0.618", "模擬價": f"${round(f618*1.002, 2)}", "策略": "🚀 重倉" if s1_cond else "⚖️ 輕倉", "倉位": "60-80%" if s1_cond else "0-20%", "推導依據": "月/周線趨勢", "止損": f"${round(f786*0.98, 2)}"},
-        {"情境": "2. 跌破 FIB 0.786", "模擬價": f"${round(f786*0.97, 2)}", "策略": "👀 離場", "倉位": "0%", "推導依據": "支撐失效", "止損": "N/A"},
-        {"情境": "3. 突破前高", "模擬價": f"${round(d_h*1.01, 2)}", "策略": "⚡ 追漲" if s3_cond else "⚠️ 謹慎", "倉位": "20-30%" if s3_cond else "10-15%", "推導依據": "日/周線趨勢", "止損": f"${round(d_h*0.97, 2)}"}
-    ])
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_ticker = {
+            executor.submit(analyze_single_stock, ticker): ticker 
+            for ticker in tickers
+        }
+        
+        for future in as_completed(future_to_ticker):
+            ticker = future_to_ticker[future]
+            try:
+                result = future.result(timeout=REQUEST_TIMEOUT)
+                if result:
+                    results.append(result)
+            except Exception as e:
+                logger.error(f"{ticker}: 執行超時或失敗 - {str(e)}")
+    
+    return results
 
-def render_results(results):
+
+# ------------------------------------------------------------------------------
+# 壓力測試情景生成 (含推導依據)
+# ------------------------------------------------------------------------------
+def generate_scenarios(f618: float, f786: float, d_h: float, trends: Dict[str, str]) -> pd.DataFrame:
+    """基於多週期分析生成壓力測試情景"""
+    
+    monthly_trend = trends.get("monthly", "盤整")
+    weekly_trend = trends.get("weekly", "盤整")
+    daily_trend = trends.get("daily", "盤整")
+    
+    # 情境 1: 回測 FIB 0.618
+    scenario1_basis = "月線 + 周線趨勢"
+    if monthly_trend == "上漲" or weekly_trend == "上漲":
+        s1_strategy = "🚀 長/中線重倉"
+        s1_pos = "60%-80%"
+    else:
+        s1_strategy = "⚖️ 觀望/輕倉試單"
+        s1_pos = "0%-20%"
+    
+    # 情境 2: 跌破 FIB 0.786
+    scenario2_basis = "FIB 支撐失效原理"
+    s2_strategy = "👀 離場觀望"
+    s2_pos = "0%"
+    
+    # 情境 3: 突破前高
+    scenario3_basis = "日線 + 周線趨勢"
+    if daily_trend == "上漲" and weekly_trend == "上漲":
+        s3_strategy = "⚡ 順勢追漲"
+        s3_pos = "20%-30%"
+    else:
+        s3_strategy = "⚠️ 謹慎追高/假突破風險"
+        s3_pos = "10%-15%"
+    
+    scenarios = [
+        {
+            "情境": "1. 回測 FIB 0.618 黃金區",
+            "模擬價": f"${round(f618 * 1.002, 2)}",
+            "策略": s1_strategy,
+            "倉位": s1_pos,
+            "推導依據": scenario1_basis,
+            "止損": f"${round(f786 * 0.98, 2)}"
+        },
+        {
+            "情境": "2. 跌破 FIB 0.786 支撐",
+            "模擬價": f"${round(f786 * 0.97, 2)}",
+            "策略": s2_strategy,
+            "倉位": s2_pos,
+            "推導依據": scenario2_basis,
+            "止損": "N/A"
+        },
+        {
+            "情境": "3. 突破前高阻力",
+            "模擬價": f"${round(d_h * 1.01, 2)}",
+            "策略": s3_strategy,
+            "倉位": s3_pos,
+            "推導依據": scenario3_basis,
+            "止損": f"${round(d_h * 0.97, 2)}"
+        }
+    ]
+    return pd.DataFrame(scenarios)
+
+
+# ------------------------------------------------------------------------------
+# 主界面邏輯
+# ------------------------------------------------------------------------------
+def render_results(results: List[Dict[str, Any]]):
+    """渲染分析結果"""
     if not results:
-        st.error("無法獲取數據。請檢查 API Key 或網路連線。")
+        st.error("無法取得相關股票數據，請檢查輸入代碼或網路連線。")
         return
     
     st.subheader("📊 實時盤口總覽")
-    df = pd.DataFrame(results)[["代碼", "現價", "漲跌額", "漲跌幅", "來源", "建議策略", "建議倉位", "Fib 0.618", "距 0.618(%)", "止損價", "confidence"]]
     
-    def fmt_chg(r):
-        if r['漲跌幅'] is None: return "N/A"
-        s = "🔺" if r['漲跌幅'] > 0 else "🔻" if r['漲跌幅'] < 0 else "➖"
-        a = f"{r['漲跌額']:+.2f}" if r['漲跌額'] else "0.00"
-        return f"{s} {a} ({r['漲跌幅']:+.2f}%)"
+    # 準備顯示數據
+    df_display = pd.DataFrame(results)[
+        ["代碼", "現價", "漲跌額", "漲跌幅", "來源", "建議策略", "建議倉位", "Fib 0.618", "距 0.618(%)", "止損價", "confidence"]
+    ]
     
-    def fmt_conf(c): return "🟢 高" if c=="高" else ("🟡 中" if c=="中" else "⚪ 低")
+    # 格式化函數
+    def format_change(row):
+        if row['漲跌幅'] is None:
+            return "N/A"
+        sign = "🔺" if row['漲跌幅'] > 0 else "🔻" if row['漲跌幅'] < 0 else "➖"
+        change_amt = f"{row['漲跌額']:+.2f}" if row['漲跌額'] else "0.00"
+        return f"{sign} {change_amt} ({row['漲跌幅']:+.2f}%)"
     
-    df['漲跌'] = df.apply(fmt_chg, axis=1)
-    df['信心'] = df['confidence'].apply(fmt_conf)
+    def format_confidence(conf):
+        if conf == "高":
+            return "🟢 高"
+        elif conf == "中":
+            return "🟡 中"
+        else:
+            return "⚪ 低"
     
-    cols = ["代碼", "現價", "漲跌", "來源", "建議策略", "建議倉位", "Fib 0.618", "距 0.618(%)", "止損價", "信心"]
-    cfg = {c: st.column_config.TextColumn(align="center") for c in cols}
-    cfg["建議策略"] = st.column_config.TextColumn(width="large")
+    df_display['漲跌'] = df_display.apply(format_change, axis=1)
+    df_display['信心'] = df_display['confidence'].apply(format_confidence)
     
-    st.dataframe(df[cols], use_container_width=True, hide_index=True, column_config=cfg)
+    # 選擇最終顯示的欄位 (移除原始數據列)
+    final_columns = ["代碼", "現價", "漲跌", "來源", "建議策略", "建議倉位", "Fib 0.618", "距 0.618(%)", "止損價", "信心"]
+    df_final = df_display[final_columns]
+    
+    # 配置列寬與置中
+    column_config = {
+        col: st.column_config.TextColumn(width="medium", align="center") 
+        for col in final_columns
+    }
+    # 特別調整策略列寬度
+    column_config["建議策略"] = st.column_config.TextColumn(width="large", align="center")
+    column_config["代碼"] = st.column_config.TextColumn(width="small", align="center")
+    
+    st.dataframe(df_final, use_container_width=True, hide_index=True, column_config=column_config)
     
     st.divider()
-    for r in results:
-        with st.expander(f"📌 **{r['代碼']}** - {r['建議策略']} (${r['現價']})", expanded=True):
-            c1, c2, c3 = st.columns(3)
-            delta = f"{r['漲跌額']:+.2f} ({r['漲跌幅']:+.2f}%)" if r['漲跌幅'] else "N/A"
-            c1.metric("現價", f"${r['現價']}", delta=delta)
-            c2.metric("Fib 0.618", f"${r['Fib 0.618']}")
-            c3.metric("止損", f"${r['止損價']}")
+    st.subheader("📱 手機卡片與多週期詳情")
+    
+    # 卡片化展示
+    for res in results:
+        with st.expander(
+            f"📌 **{res['代碼']}** - {res['建議策略']} (現價: ${res['現價']})",
+            expanded=True
+        ):
+            change_percent = res.get('漲跌幅')
+            change_amount = res.get('漲跌額')
             
-            st.markdown("#### 🌊 多週期趨勢")
-            cs = st.columns(4)
-            for i, (p, n) in enumerate(zip(["monthly", "weekly", "daily", "hourly"], ["月線", "周線", "日線", "小時線"])):
-                t = r['trends'].get(p, "?")
-                em = "🔺" if t=="上漲" else "🔻" if t=="下跌" else "➖"
-                cs[i].metric(n, f"{em} {t}")
-                cs[i].caption(f"階段：{r['wave_stages'].get(p, '?')}")
+            if change_percent is not None:
+                delta_color = "normal"
+                delta_text = f"{change_amount:+.2f} ({change_percent:+.2f}%)" if change_amount else "0.00 (0.00%)"
+            else:
+                delta_text = "N/A"
             
-            if r.get('news'):
-                st.markdown("### 📰 新聞")
-                for n in r['news'][:3]:
-                    em = "🟢" if n['type']=="利好" else "🔴" if n['type']=="利空" else "⚪"
-                    st.markdown(f"{em} **[{n['type']}]** {n['title']}")
-                    st.caption(f"🕒 {n['time']} | 📰 {n['publisher']}")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("現價", f"${res['現價']}", delta=delta_text, delta_color=delta_color)
+            m2.metric("Fib 0.618", f"${res['Fib 0.618']}")
+            m3.metric("建議止損", f"${res['止損價']}")
             
-            st.table(generate_scenarios(r["_f618"], r["_f786"], r["_d_h"], r["trends"]))
+            # 多週期趨勢展示
+            st.markdown("#### 🌊 多週期趨勢分析")
+            cols = st.columns(4)
+            periods = ["monthly", "weekly", "daily", "hourly"]
+            period_names = ["月線", "周線", "日線", "小時線"]
+            
+            for i, (period, name) in enumerate(zip(periods, period_names)):
+                trend = res['trends'].get(period, "未知")
+                stage = res['wave_stages'].get(period, "未知")
+                trend_emoji = "🔺" if trend == "上漲" else "🔻" if trend == "下跌" else "➖"
+                with cols[i]:
+                    st.metric(f"{name}趨勢", f"{trend_emoji} {trend}")
+                    st.caption(f"階段：{stage}")
+            
+            st.caption(
+                f"**建議倉位**：{res['建議倉位']}｜"
+                f"**距離 0.618**：{res['距 0.618(%)']}｜"
+                f"**信心等級**：{res['confidence']}｜"
+                f"**價格來源**：{res['來源']}"
+            )
+            
+            # 新聞區域
+            news_list = res.get('news', [])
+            if news_list:
+                st.markdown("### 📰 最新個股新聞")
+                for i, news in enumerate(news_list, 1):
+                    news_type_emoji = "🟢" if news['type'] == '利好' else "🔴" if news['type'] == '利空' else "⚪"
+                    with st.container():
+                        st.markdown(f"**{i}. {news_type_emoji} [{news['type']}]** {news['title']}")
+                        st.caption(f"🕒 {news['time']} | 📰 {news['publisher']}")
+                        if news['link']:
+                            st.markdown(f"[🔗 閱讀全文]({news['link']})")
+                        st.divider()
+            
+            # 壓力測試情景
+            scenarios_df = generate_scenarios(
+                res["_f618"],
+                res["_f786"],
+                res["_d_h"],
+                res["trends"]
+            )
+            
+            # 自定義情景表格樣式
+            st.table(scenarios_df)
+
 
 def main():
-    raw = st.text_input("輸入股票代碼", value="AAPL NVDA TSLA")
-    if st.button("🔍 開始掃描", use_container_width=True):
-        tickers = parse_tickers(raw)
+    """主函數"""
+    raw_input = st.text_input(
+        "輸入股票代碼 (支援空格/逗號分隔):",
+        value="BA, NVDA, TSLA",
+        help="例如：AAPL, MSFT, GOOGL 或 AAPL MSFT GOOGL"
+    )
+    
+    if st.button("🔍 開始多週期掃描分析", use_container_width=True):
+        tickers = parse_tickers(raw_input)
+        
         if not tickers:
-            st.warning("請輸入有效代碼")
-            return
-        if 'FINNHUB_KEY' not in st.session_state:
-            st.error("請在側邊欄輸入 Finnhub API Key")
+            st.warning("請輸入有效的股票代碼！")
             return
         
-        with st.spinner("數據抓取中 (自動降級備援)..."):
-            res = analyze_stocks_parallel(tickers)
-        render_results(res)
+        with st.spinner(f"正即時連線抓取 {len(tickers)} 支股票的多週期數據 (月/周/日/小時)..."):
+            results = analyze_stocks_parallel(tickers, max_workers=min(5, len(tickers)))
+        
+        render_results(results)
+
 
 if __name__ == "__main__":
     main()
