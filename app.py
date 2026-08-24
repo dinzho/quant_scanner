@@ -170,7 +170,7 @@ def fetch_finnhub_history(ticker_symbol: str, api_key: str) -> Optional[Dict[str
         logger.error(f"{ticker_symbol}: Finnhub 抓取異常 - {str(e)}")
         return None
 
-def fetch_yf_hourly_and_price(ticker_symbol: str) -> Tuple[Optional[pd.DataFrame], Optional[Dict[str, Any]]:
+def fetch_yf_hourly_and_price(ticker_symbol: str) -> Tuple[Optional[pd.DataFrame], Optional[Dict[str, Any]]]:
     """使用 Yahoo 抓取小時線 (用於短線訊號) 和 實時價格"""
     try:
         ticker = yf.Ticker(ticker_symbol)
