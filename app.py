@@ -188,7 +188,7 @@ def fetch_multi_period_data(ticker_symbol: str) -> Optional[Dict[str, pd.DataFra
         return None
 
 @st.cache_data(ttl=CACHE_TTL_PRICE, show_spinner=False)
-def fetch_yf_hourly_and_price(ticker_symbol: str) -> Tuple[Optional[pd.DataFrame], Optional[Dict[str, Any]]:
+def fetch_yf_hourly_and_price(ticker_symbol: str) -> Tuple[Optional[pd.DataFrame], Optional[Dict[str, Any]]]:
     """
     使用 Yahoo Finance 抓取即時價格和備用小時線
     修復語法錯誤：添加缺失的閉合括號
