@@ -29,7 +29,6 @@ MAX_TICKERS = 50  # 最大股票數量限制
 REQUEST_TIMEOUT = 45  # API 請求超時時間 (秒)
 CACHE_TTL_HISTORY = 300  # 歷史數據快取時間 (秒)
 CACHE_TTL_PRICE = 60  # 實時價格快取時間 (秒)
-CACHE_TTL_NEWS = 120  # 新聞數據快取時間 (秒)
 MIN_DATA_POINTS = 60  # 最小數據點要求
 VOL_SPIKE_THRESHOLD = 1.5  # 成交量放大倍數閾值
 EMA_PERIOD = 20  # EMA 週期
@@ -393,56 +392,6 @@ def determine_strategy(trends: Dict[str, str], in_fib_zone: bool,
             "color": "gray"
         }
 
-
-# ------------------------------------------------------------------------------
-# 新聞模組
-# ------------------------------------------------------------------------------
-def fetch_news(ticker_symbol: str) -> List[Dict[str, Any]]:
-    """抓取個股新聞"""
-    try:
-        cache_key = f"{ticker_symbol}_{datetime.now().strftime('%Y-%m-%d_%H')}"
-        if cache_key in NEWS_CACHE:
-            cache_time, cached_news = NEWS_CACHE[cache_key]
-            if (datetime.now() - cache_time).total_seconds() < CACHE_TTL_NEWS:
-                return cached_news
-        
-        ticker = yf.Ticker(ticker_symbol)
-        news_list = []
-        
-        try:
-            news_items = ticker.news
-            if news_items:
-                for item in news_items[:5]:
-                    title = item.get("title", "無標題")
-                    title_lower = title.lower()
-                    
-                    news_type = "中性"
-                    if any(word in title_lower for word in ['beat', 'surge', 'gain', 'up', 'rise', 'buy', 'upgrade', 'record', 'profit']):
-                        news_type = "利好"
-                    elif any(word in title_lower for word in ['miss', 'drop', 'fall', 'down', 'sell', 'downgrade', 'lawsuit', 'loss', 'warning']):
-                        news_type = "利空"
-                    
-                    news_entry = {
-                        "title": title,
-                        "publisher": item.get("publisher", "未知來源"),
-                        "link": item.get("link", ""),
-                        "time": datetime.fromtimestamp(item.get("providerPublishTime", 0)).strftime("%Y-%m-%d %H:%M") if item.get("providerPublishTime") else "未知時間",
-                        "type": news_type
-                    }
-                    news_list.append(news_entry)
-        except Exception:
-            pass
-        
-        if news_list:
-            NEWS_CACHE[cache_key] = (datetime.now(), news_list)
-        
-        return news_list
-    
-    except Exception as e:
-        logger.error(f"{ticker_symbol}: 新聞抓取異常 - {str(e)}")
-        return []
-
-
 # ------------------------------------------------------------------------------
 # 核心分析函數
 # ------------------------------------------------------------------------------
@@ -517,7 +466,6 @@ def analyze_single_stock(ticker: str) -> Optional[Dict[str, Any]]:
             "止損價": hourly_stop_loss,
             "color": strategy_info["color"],
             "confidence": confidence,
-            "news": news_list,
             "trends": trends,
             "wave_stages": wave_stages,
             "_d_h": daily_high,
